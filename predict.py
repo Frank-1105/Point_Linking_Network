@@ -7,6 +7,8 @@ from matplotlib import pyplot as plt
 from torchvision.transforms import ToTensor
 
 from PLNnet import pretrained_inception, inceptionresnetv2
+from validate import compute_area
+
 # from new_resnet import pretrained_inception
 
 # from draw_rectangle import draw
@@ -17,8 +19,8 @@ classes = {"aeroplane": 0, "bicycle": 1, "bird": 2, "boat": 3, "bottle": 4, "bus
            "sheep": 16, "sofa": 17, "train": 18, "tvmonitor": 19}
 
 # 测试图片的路径
-# img_root = r"E:\datasets\pascalvoc\pascalvoc\VOCdevkit\VOC2007\JPEGImages\002621.jpg"
-img_root = r"C:\Users\ZHENGZHIQIAN\Desktop\20250507210205.jpg"
+img_root = r"E:\datasets\pascalvoc\pascalvoc\VOCdevkit\VOC2007\JPEGImages\005764.jpg"
+# img_root = r"C:\Users\ZHENGZHIQIAN\Desktop\20250507210205.jpg"
 # # 网络模型
 # model = resnet50()
 def init_model():
@@ -149,78 +151,76 @@ class Pred():
         # cv2.waitKey(0)
 
     # 接受的result的形状为1*7*7*204
+    import torch
+
     def Decode(self, branch, result):
         result = result.squeeze()
-        # result [14*14*204]
-        # 0 pij 1x 2y
-        # 3-16 lxij 16-30 lyij
-        # 31-50 qij
+        # Vectorized softmax (保持原始分组不变)
+        for p in range(4):
+            result[..., 51 * p + 3:51 * p + 17] = torch.softmax(result[..., 51 * p + 3:51 * p + 17], dim=-1)
+            result[..., 51 * p + 17:51 * p + 31] = torch.softmax(result[..., 51 * p + 17:51 * p + 31], dim=-1)
+            result[..., 51 * p + 31:51 * p + 51] = torch.softmax(result[..., 51 * p + 31:51 * p + 51], dim=-1)
+
         r = []
-        bboxes_ = list()
-        labels_ = list()
-        scores_ = list()
-        for i in range(14):
-            for j in range(14):
-                for p in range(4):
-                    result[i, j, 51 * p + 3:51 * p + 17] = torch.softmax(result[i, j, 51 * p + 3:51 * p + 17], dim=-1)
-                    result[i, j, 51 * p + 17:51 * p + 31] = torch.softmax(result[i, j, 51 * p + 17:51 * p + 31], dim=-1)
-                    result[i, j, 51 * p + 31:51 * p + 51] = torch.softmax(result[i, j, 51 * p + 31:51 * p + 51], dim=-1)
-
         for p in range(2):
-            # ij center || mn corner
-            for i in range(14):
-                for j in range(14):
-                    # print("start,", i, j)
-                    if result[i, j, p * 51] < p_confident:
-                        continue
-                    # print("pij", p, result[i, j, p * 51])
-                    # 右上角启发区域
-                    # x_area, y_area = [j, 14], [0, i + 1]
-                    x_area, y_area = self.compute_area(branch,j,i)
-                    for n in range(y_area[0], y_area[1]):
-                        for m in range(x_area[0], x_area[1]):
-                            for c in range(20):
-                                p_ij = result[i, j, 51 * p + 0]
-                                p_nm = result[n, m, 51 * (p + 2) + 0]
-                                i_, j_, n_, m_ = result[i, j, 51 * p + 2], result[i, j, 51 * p + 1], result[
-                                    n, m, 51 * (p + 2) + 2], result[n, m, 51 * (p + 2) + 1]
-                                l_ij_x = result[i, j, 51 * p + 3 + m]
-                                l_ij_y = result[i, j, 51 * p + 3 + n]
-                                l_nm_x = result[n, m, 51 * (p + 2) + 17 + j]
-                                l_nm_y = result[n, m, 51 * (p + 2) + 17 + i]
-                                q_cij = result[i, j, 51 * p + 31 + c]
-                                q_cnm = result[n, m, 51 * (p + 2) + 31 + c]
-                                score = p_ij * p_nm * q_cij * q_cnm * (l_ij_x * l_ij_y + l_nm_x * l_nm_y) / 2
-                                score *= 1000
+            # 获取所有满足p_ij >= p_confident的(i,j)坐标
+            confident_mask = result[..., 51 * p] >= p_confident
+            confident_indices = torch.nonzero(confident_mask, as_tuple=False)
 
-                                if score > score_confident:
-                                    print(i, j, n, m)
-                                    print("score", score)
-                                    r.append([i + i_, j + j_, n + n_, m + m_, c, score])
-            for l in r:
-                # 重新encode 变为xmin,ymin,xmax,ymax,score.class
-                if branch == 0:
-                    # 左下角
-                    bbox = [l[3], 2 * l[0] - l[2], 2 * l[1] - l[3], l[2]]
-                elif branch == 1:
-                    # 左上角
-                    bbox = [l[3], l[2], 2 * l[1] - l[3], 2 * l[0] - l[2]]
-                elif branch == 2:
-                    # 右下角
-                    bbox = [2 * l[1] - l[3], 2 * l[0] - l[2], l[3], l[2]]
-                elif branch == 3:
-                    # 右上角
-                    bbox = [2 * l[1] - l[3], l[2], l[3], 2 * l[0] - l[2]]
+            for idx in confident_indices:
+                i, j = idx[0].item(), idx[1].item()
+                x_area, y_area = self.compute_area(branch, j, i)
 
-                # print(bbox)
-                bbox = [b * 32 for b in bbox]
-                bboxes_.append(bbox)
-                labels_.append(l[4])
-                scores_.append(l[5])  # result of a img
-                # bboxes_nms = self._suppress(bboxes_, scores_)
-        # print(bboxes_)
-        # print(labels_)
-        # print(scores_)
+                # 生成所有可能的(n,m,c)组合
+                for n in range(y_area[0], y_area[1]):
+                    for m in range(x_area[0], x_area[1]):
+                        for c in range(20):
+                            # 严格保持原始索引计算逻辑
+                            p_ij = result[i, j, 51 * p]
+                            p_nm = result[n, m, 51 * (p + 2)]
+                            i_ = result[i, j, 51 * p + 2].item()
+                            j_ = result[i, j, 51 * p + 1].item()
+                            n_ = result[n, m, 51 * (p + 2) + 2].item()
+                            m_ = result[n, m, 51 * (p + 2) + 1].item()
+
+                            l_ij_x = result[i, j, 51 * p + 3 + m].item()
+                            l_ij_y = result[i, j, 51 * p + 3 + n].item()
+                            l_nm_x = result[n, m, 51 * (p + 2) + 17 + j].item()
+                            l_nm_y = result[n, m, 51 * (p + 2) + 17 + i].item()
+                            q_cij = result[i, j, 51 * p + 31 + c].item()
+                            q_cnm = result[n, m, 51 * (p + 2) + 31 + c].item()
+
+                            score = p_ij * p_nm * q_cij * q_cnm * (l_ij_x * l_ij_y + l_nm_x * l_nm_y) / 2 * 1000
+
+                            if score > score_confident:
+                                # 严格保持原始append逻辑
+                                r.append([
+                                    i + i_,
+                                    j + j_,
+                                    n + n_,
+                                    m + m_,
+                                    c,
+                                    score
+                                ])
+
+        # 后续bbox转换与原始代码完全一致
+        bboxes_ = []
+        labels_ = []
+        scores_ = []
+        for l in r:
+            if branch == 0:
+                bbox = [l[3], 2 * l[0] - l[2], 2 * l[1] - l[3], l[2]]
+            elif branch == 1:
+                bbox = [l[3], l[2], 2 * l[1] - l[3], 2 * l[0] - l[2]]
+            elif branch == 2:
+                bbox = [2 * l[1] - l[3], 2 * l[0] - l[2], l[3], l[2]]
+            elif branch == 3:
+                bbox = [2 * l[1] - l[3], l[2], l[3], 2 * l[0] - l[2]]
+            bbox = [b * 32 for b in bbox]
+            bboxes_.append(bbox)
+            labels_.append(l[4])
+            scores_.append(l[5])
+
         bbox_info = torch.zeros(len(labels_), 6)
         for i in range(len(labels_)):
             bbox_info[i, 0] = bboxes_[i][0]
@@ -230,8 +230,6 @@ class Pred():
             bbox_info[i, 4] = scores_[i]
             bbox_info[i, 5] = labels_[i]
 
-        print("bbox_info success")
-        print(bbox_info)
         return bbox_info
 
     # 非极大值抑制处理，按照类别处理，bbox为Decode获取的预测框的位置信息和类别概率和类别信息

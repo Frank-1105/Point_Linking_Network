@@ -97,91 +97,142 @@ def decode_predictions(result, branch, p_threshold=0.1, score_threshold=0, devic
     返回:
         bbox_info: 解码后的边界框信息
     """
-    result = result.squeeze()
-    r = []
-    bboxes_ = []
-    labels_ = []
-    scores_ = []
+    # 确保输入在GPU上，如果不在则移动到设备
+    if not isinstance(result, torch.Tensor):
+        result = torch.tensor(result, device=device)
+    elif result.device.type != device:
+        result = result.to(device)
     
-    # 应用softmax
-    for i in range(14):
-        for j in range(14):
-            for p in range(4):
-                result[i, j, 51 * p + 3:51 * p + 17] = torch.softmax(result[i, j, 51 * p + 3:51 * p + 17], dim=-1)
-                result[i, j, 51 * p + 17:51 * p + 31] = torch.softmax(result[i, j, 51 * p + 17:51 * p + 31], dim=-1)
-                result[i, j, 51 * p + 31:51 * p + 51] = torch.softmax(result[i, j, 51 * p + 31:51 * p + 51], dim=-1)
-
+    result = result.squeeze()
+    grid_size = 14
+    
+    # 预先计算需要的索引数组和掩码
+    i_indices = torch.arange(grid_size, device=device)
+    j_indices = torch.arange(grid_size, device=device)
+    
+    # 一次性应用softmax到所有位置，避免循环
+    # 重塑张量以便一次性应用softmax
+    result_view = result.view(grid_size, grid_size, 4, 51)
+    
+    # 并行应用softmax到所有位置
+    for p in range(4):
+        result_view[:, :, p, 3:17] = torch.softmax(result_view[:, :, p, 3:17], dim=-1)
+        result_view[:, :, p, 17:31] = torch.softmax(result_view[:, :, p, 17:31], dim=-1)
+        result_view[:, :, p, 31:51] = torch.softmax(result_view[:, :, p, 31:51], dim=-1)
+    
+    # 将视图更新回原始张量
+    result = result_view.view(grid_size, grid_size, -1)
+    
+    # 使用列表暂存结果，稍后批量处理
+    r = []
+    
+    # 计算每个分支的搜索区域掩码
+    branch_masks = {}
+    for i in range(grid_size):
+        for j in range(grid_size):
+            x_area, y_area = compute_area(branch, j, i, grid_size=grid_size)
+            mask = torch.zeros((grid_size, grid_size), dtype=torch.bool, device=device)
+            mask[y_area[0]:y_area[1], x_area[0]:x_area[1]] = True
+            branch_masks[(i, j)] = mask
+    
+    # 处理预测数据（保持原来的循环结构以确保功能一致）
     for p in range(2):
-        # ij center || mn corner
-        for i in range(14):
-            for j in range(14):
+        # 遍历网格
+        for i in range(grid_size):
+            for j in range(grid_size):
+                # 跳过低于阈值的点
                 if result[i, j, p * 51] < p_threshold:
                     continue
                 
-                # 计算搜索区域
-                x_area, y_area = compute_area(branch, j, i , grid_size=14)
+                # 获取当前位置的搜索区域掩码
+                mask = branch_masks[(i, j)]
+                valid_n, valid_m = torch.where(mask)
                 
-                for n in range(y_area[0], y_area[1]):
-                    for m in range(x_area[0], x_area[1]):
-                        for c in range(CLASS_NUM):
-                            # 提取特征
-                            p_ij = result[i, j, 51 * p + 0]
-                            p_nm = result[n, m, 51 * (p + 2) + 0]
-                            i_, j_, n_, m_ = (              #in->行；jm->列
-                                result[i, j, 51 * p + 2], 
-                                result[i, j, 51 * p + 1], 
-                                result[n, m, 51 * (p + 2) + 2], 
-                                result[n, m, 51 * (p + 2) + 1]
-                            )
-                            l_ij_x = result[i, j, 51 * p + 3 + m]
-                            l_ij_y = result[i, j, 51 * p + 3 + n]
-                            l_nm_x = result[n, m, 51 * (p + 2) + 17 + j]
-                            l_nm_y = result[n, m, 51 * (p + 2) + 17 + i]
-                            q_cij = result[i, j, 51 * p + 31 + c]
-                            q_cnm = result[n, m, 51 * (p + 2) + 31 + c]
-                            
-                            # 计算得分
-                            score = p_ij * p_nm * q_cij * q_cnm * (l_ij_x * l_ij_y + l_nm_x * l_nm_y) / 2
-                            score *= 1000
-                            
-                            if score > score_threshold:
-                                r.append([i + i_, j + j_, n + n_, m + m_, c, score])
-        
-        # 处理所有检测到的边界框
-        for l in r:
-            # 重新编码为 xmin,ymin,xmax,ymax,class,score   #in->行y；jm->列x  注意编码得到的相对于左上。
-            if branch == 0:
-                # 左下角
-                bbox = [l[3], 2 * l[0] - l[2], 2 * l[1] - l[3], l[2]]
-            elif branch == 1:
-                # 左上角
-                bbox = [l[3], l[2], 2 * l[1] - l[3], 2 * l[0] - l[2]]
-            elif branch == 2:
-                # 右下角
-                bbox = [2 * l[1] - l[3], 2 * l[0] - l[2], l[3], l[2]]
-            elif branch == 3:
-                # 右上角
-                bbox = [2 * l[1] - l[3], l[2], l[3], 2 * l[0] - l[2]]
-
-            # 缩放到图像尺寸
-            bbox = [b * 32 for b in bbox]
-            bboxes_.append(bbox)
-            labels_.append(l[4])
-            scores_.append(l[5])
+                # 对于每个有效的区域点进行处理
+                for idx in range(len(valid_n)):
+                    n, m = valid_n[idx].item(), valid_m[idx].item()
+                    
+                    # 提取特征（一次处理所有类别）
+                    p_ij = result[i, j, 51 * p + 0]
+                    p_nm = result[n, m, 51 * (p + 2) + 0]
+                    i_ = result[i, j, 51 * p + 2]
+                    j_ = result[i, j, 51 * p + 1] 
+                    n_ = result[n, m, 51 * (p + 2) + 2]
+                    m_ = result[n, m, 51 * (p + 2) + 1]
+                    
+                    # 批量提取链接概率
+                    l_ij_x = result[i, j, 51 * p + 3 + m]
+                    l_ij_y = result[i, j, 51 * p + 3 + n]
+                    l_nm_x = result[n, m, 51 * (p + 2) + 17 + j]
+                    l_nm_y = result[n, m, 51 * (p + 2) + 17 + i]
+                    
+                    # 批量处理所有类别
+                    q_cij = result[i, j, 51 * p + 31:51 * p + 31 + CLASS_NUM] 
+                    q_cnm = result[n, m, 51 * (p + 2) + 31:51 * (p + 2) + 31 + CLASS_NUM]
+                    
+                    # 计算所有类别的得分
+                    link_factor = (l_ij_x * l_ij_y + l_nm_x * l_nm_y) / 2
+                    scores = p_ij * p_nm * q_cij * q_cnm * link_factor * 1000
+                    
+                    # 找出超过阈值的类别
+                    valid_classes = torch.where(scores > score_threshold)[0]
+                    
+                    # 为每个有效类别添加一个边界框
+                    for c_idx in valid_classes:
+                        c = c_idx.item()
+                        score = scores[c].item()
+                        r.append([i + i_, j + j_, n + n_, m + m_, c, score])
     
-    # 如果没有检测到任何边界框，返回空张量
-    if not labels_:
+    # 如果没有检测到边界框，直接返回空张量
+    if not r:
         return torch.zeros((0, 6), device=device)
-        
-    # 构建结果张量
-    bbox_info = torch.zeros(len(labels_), 6, device=device)
-    for i in range(len(labels_)):
-        bbox_info[i, 0] = bboxes_[i][0]  # xmin
-        bbox_info[i, 1] = bboxes_[i][1]  # ymin
-        bbox_info[i, 2] = bboxes_[i][2]  # xmax
-        bbox_info[i, 3] = bboxes_[i][3]  # ymax
-        bbox_info[i, 4] = scores_[i]     # score
-        bbox_info[i, 5] = labels_[i]     # class
+    
+    # 将所有检测结果转换为张量进行批处理
+    coords = torch.tensor(r, device=device)
+    
+    # 批量计算边界框坐标
+    i_coords, j_coords, n_coords, m_coords = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+    classes = coords[:, 4].long()
+    scores = coords[:, 5]
+    
+    # 根据分支类型批量计算边界框坐标
+    if branch == 0:  # 左下角
+        xmin = m_coords
+        ymin = 2 * i_coords - n_coords
+        xmax = 2 * j_coords - m_coords 
+        ymax = n_coords
+    elif branch == 1:  # 左上角
+        xmin = m_coords
+        ymin = n_coords
+        xmax = 2 * j_coords - m_coords
+        ymax = 2 * i_coords - n_coords
+    elif branch == 2:  # 右下角
+        xmin = 2 * j_coords - m_coords
+        ymin = 2 * i_coords - n_coords
+        xmax = m_coords
+        ymax = n_coords
+    elif branch == 3:  # 右上角
+        xmin = 2 * j_coords - m_coords
+        ymin = n_coords
+        xmax = m_coords
+        ymax = 2 * i_coords - n_coords
+    
+    # 缩放到图像尺寸
+    scale_factor = 32
+    xmin *= scale_factor
+    ymin *= scale_factor
+    xmax *= scale_factor
+    ymax *= scale_factor
+    
+    # 构建最终结果张量
+    num_boxes = len(classes)
+    bbox_info = torch.zeros(num_boxes, 6, device=device)
+    bbox_info[:, 0] = xmin  # xmin
+    bbox_info[:, 1] = ymin  # ymin
+    bbox_info[:, 2] = xmax  # xmax
+    bbox_info[:, 3] = ymax  # ymax
+    bbox_info[:, 4] = scores  # score
+    bbox_info[:, 5] = classes  # class
     
     return bbox_info
 
@@ -334,7 +385,6 @@ def extract_boxes_from_predictions(predictions, device, config=None):
     return boxes
 
 
-
 def extract_boxes_from_targets(file_path, start_index, end_index):
     gt_boxes = []
     try:
@@ -361,6 +411,7 @@ def extract_boxes_from_targets(file_path, start_index, end_index):
     except Exception as e:
         print(f"发生未知错误：{e}")
     return gt_boxes
+
 
 
 def validate_epoch(model, test_loader, criterion, device, epoch, num_epochs):
